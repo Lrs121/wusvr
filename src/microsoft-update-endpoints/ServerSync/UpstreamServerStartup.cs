@@ -119,6 +119,10 @@ namespace Microsoft.PackageGraph.MicrosoftUpdate.Endpoints.ServerSync
                    name: "legacyContent",
                    pattern: "Content/{contentPrefix}/{contentHash}.txt",
                    defaults: new { controller = "MicrosoftUpdateContent", action = "GetMicrosoftUpdateContent" });
+                endpoints.MapControllerRoute(
+                   name: "legacyContentWithExtension",
+                   pattern: "Content/{contentPrefix}/{contentHash}.{extension}",
+                   defaults: new { controller = "MicrosoftUpdateContent", action = "GetMicrosoftUpdateContent" });
             });
 
             // Wire the upstream WCF services
