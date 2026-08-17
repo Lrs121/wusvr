@@ -699,6 +699,12 @@
             </summary>
             <param name="packageSource">The package store to server updates from</param>
         </member>
+        <member name="M:Microsoft.PackageGraph.MicrosoftUpdate.Endpoints.ServerSync.ServerSyncWebService.SetContentStore(Microsoft.PackageGraph.Storage.IContentStore)">
+            <summary>
+            Sets the content store used to determine whether advertised updates
+            can actually be served to a downstream WSUS server.
+            </summary>
+        </member>
         <member name="M:Microsoft.PackageGraph.MicrosoftUpdate.Endpoints.ServerSync.ServerSyncWebService.GetAuthConfigAsync(Microsoft.UpdateServices.WebServices.ServerSync.GetAuthConfigRequest)">
             <summary>
             Handle authentication data requests

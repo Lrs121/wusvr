@@ -332,7 +332,37 @@ namespace Microsoft.PackageGraph.MicrosoftUpdate.Source
 
                 foreach (var rawUpdate in updateDataReply.GetUpdateDataResponse1.GetUpdateDataResult.updates)
                 {
-                    packages.Add(InMemoryUpdateFactory.FromServerSyncData(rawUpdate, filesList));
+                    try
+                    {
+                        packages.Add(InMemoryUpdateFactory.FromServerSyncData(rawUpdate, filesList));
+                    }
+                    catch (Exception ex)
+                    {
+                        try
+                        {
+                            var retryRequest = new GetUpdateDataRequest
+                            {
+                                GetUpdateData = new GetUpdateDataRequestBody
+                                {
+                                    cookie = AccessToken.AccessCookie,
+                                    updateIds = new[] { rawUpdate.Id }
+                                }
+                            };
+                            var retryReply = ServerSyncClient.GetUpdateDataAsync(retryRequest).GetAwaiter().GetResult();
+                            var retryResult = retryReply.GetUpdateDataResponse1.GetUpdateDataResult;
+                            var retryFiles = retryResult.fileUrls
+                                .Select(rawFile => InMemoryUpdateFactory.FromServerSyncData(rawFile))
+                                .ToDictionary(file => file.DigestBase64);
+                            foreach (var retryUpdate in retryResult.updates)
+                            {
+                                packages.Add(InMemoryUpdateFactory.FromServerSyncData(retryUpdate, retryFiles));
+                            }
+                        }
+                        catch (Exception retryException)
+                        {
+                            Console.Error.WriteLine($"Skipping malformed update {rawUpdate?.Id?.UpdateID}/{rawUpdate?.Id?.RevisionNumber}: {ex.Message}; retry: {retryException.Message}");
+                        }
+                    }
                 }
             });
 

@@ -212,6 +212,8 @@ namespace Microsoft.PackageGraph.Utilitites.Upsync
 
         [Option("first", Required = false, Default = 0, HelpText = "Content sync only the first x packages")]
         public int FirstX { get; set; }
+        [Option("english-only", Required = false, Default = false, HelpText = "Include only English and language-neutral update content")]
+        public bool EnglishOnly { get; set; }
     }
 
     [Verb("status", HelpText = "Displays status information about and updates metadata source")]

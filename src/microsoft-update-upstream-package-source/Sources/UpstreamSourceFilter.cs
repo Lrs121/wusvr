@@ -193,7 +193,9 @@ namespace Microsoft.PackageGraph.MicrosoftUpdate.Source
                 }
                 else
                 {
-                    var prereqs = u.Prerequisites.OfType<AtLeastOne>().SelectMany(p => p.Simple).Select(s => s.UpdateId).ToList();
+                    var prereqs = u.Prerequisites.OfType<AtLeastOne>().SelectMany(p => p.Simple).Select(s => s.UpdateId)
+                        .Concat(u.Prerequisites.OfType<Simple>().Select(s => s.UpdateId))
+                        .ToList();
                     return prereqs.Intersect(ClassificationsFilter).Any() && prereqs.Intersect(ProductsFilter).Any();
                 }
             });

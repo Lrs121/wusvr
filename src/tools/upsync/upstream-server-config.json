@@ -12,7 +12,7 @@
       "LanguageID": 1033,
       "ShortLanguage": "en",
       "LongLanguage": "English",
-      "Enabled": false
+      "Enabled": true
     }
   ],
   "MaxUpdatesPerRequestInGetUpdateDecryptionData": 500

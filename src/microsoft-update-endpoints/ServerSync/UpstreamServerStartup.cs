@@ -76,12 +76,14 @@ namespace Microsoft.PackageGraph.MicrosoftUpdate.Endpoints.ServerSync
             var serverSyncService = new ServerSyncWebService();
             serverSyncService.SetServerConfiguration(ServiceConfiguration);
             serverSyncService.SetPackageStore(PackageSource);
+            serverSyncService.SetContentStore(LocalContentSource);
             services.TryAddSingleton<ServerSyncWebService>(serverSyncService);
             services.TryAddSingleton<AuthenticationWebService>();
             services.TryAddSingleton<ReportingWebService>();
 
             if (LocalContentSource != null)
             {
+                services.TryAddSingleton<IContentStore>(LocalContentSource);
                 // Enable the content controller if serving content
                 // Add your content controller here
 
@@ -112,6 +114,10 @@ namespace Microsoft.PackageGraph.MicrosoftUpdate.Endpoints.ServerSync
                 endpoints.MapControllerRoute(
                    name: "getContent",
                    pattern: "microsoftupdate/content/{contentHash}",
+                   defaults: new { controller = "MicrosoftUpdateContent", action = "GetMicrosoftUpdateContent" });
+                endpoints.MapControllerRoute(
+                   name: "legacyContent",
+                   pattern: "Content/{contentPrefix}/{contentHash}.txt",
                    defaults: new { controller = "MicrosoftUpdateContent", action = "GetMicrosoftUpdateContent" });
             });
 

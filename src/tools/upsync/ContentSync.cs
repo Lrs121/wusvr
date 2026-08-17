@@ -10,6 +10,9 @@ using Microsoft.PackageGraph.ObjectModel;
 using Microsoft.PackageGraph.Storage;
 using Microsoft.PackageGraph.MicrosoftUpdate.Metadata;
 using System.Collections.Generic;
+using System.IO;
+using System.Xml;
+using System.Xml.XPath;
 using Microsoft.PackageGraph.Storage.Local;
 
 namespace Microsoft.PackageGraph.Utilitites.Upsync
@@ -38,11 +41,11 @@ namespace Microsoft.PackageGraph.Utilitites.Upsync
 
             var filteredPackages = filter.Apply(metadataSource);
 
-            var filesToDownload = filteredPackages.Where(p => p.Files != null).SelectMany(p => p.Files).ToList();
+            var filesToDownload = filteredPackages.Where(p => (!options.EnglishOnly || IsEnglishOrNeutral(metadataSource, p as MicrosoftUpdatePackage)) && p.Files != null).SelectMany(p => p.Files).ToList();
 
             foreach(var microsoftUpdatePackage in filteredPackages.OfType<MicrosoftUpdatePackage>())
             {
-                filesToDownload.AddRange(GetAllUpdateFiles(metadataSource, microsoftUpdatePackage));
+                filesToDownload.AddRange(GetAllUpdateFiles(metadataSource, microsoftUpdatePackage, options.EnglishOnly));
             }
 
             filesToDownload = filesToDownload.Distinct().ToList();
@@ -63,9 +66,13 @@ namespace Microsoft.PackageGraph.Utilitites.Upsync
         /// </summary>
         /// <param name="update"></param>
         /// <returns></returns>
-        private static List<IContentFile> GetAllUpdateFiles(IMetadataStore metadataSource, MicrosoftUpdatePackage update)
+        private static List<IContentFile> GetAllUpdateFiles(IMetadataStore metadataSource, MicrosoftUpdatePackage update, bool englishOnly)
         {
             var filesList = new List<IContentFile>();
+            if (englishOnly && !IsEnglishOrNeutral(metadataSource, update))
+            {
+                return filesList;
+            }
             if (update.Files != null)
             {
                 filesList.AddRange(update.Files);
@@ -75,25 +82,58 @@ namespace Microsoft.PackageGraph.Utilitites.Upsync
             {
                 foreach (var bundledUpdate in softwareUpdate.BundledUpdates)
                 {
-                    filesList.AddRange(
-                        GetAllUpdateFiles(
-                            metadataSource,
-                            metadataSource.GetPackage(bundledUpdate) as MicrosoftUpdatePackage));
+                    try
+                    {
+                        var bundledPackage = metadataSource.GetPackage(bundledUpdate) as MicrosoftUpdatePackage;
+                        if (bundledPackage == null)
+                        {
+                            Console.Error.WriteLine($"Skipping missing bundled update {bundledUpdate}");
+                            continue;
+                        }
+                        filesList.AddRange(GetAllUpdateFiles(metadataSource, bundledPackage, englishOnly));
+                    }
+                    catch (KeyNotFoundException)
+                    {
+                        Console.Error.WriteLine($"Skipping missing bundled update {bundledUpdate}");
+                    }
                 }
             }
 
             return filesList;
         }
 
+        private static bool IsEnglishOrNeutral(IMetadataStore metadataSource, MicrosoftUpdatePackage update)
+        {
+            using var metadataStream = metadataSource.GetMetadata(update.Id);
+            var document = new XPathDocument(metadataStream);
+            var navigator = document.CreateNavigator();
+            var namespaces = new XmlNamespaceManager(navigator.NameTable);
+            namespaces.AddNamespace("upd", "http://schemas.microsoft.com/msus/2002/12/Update");
+            var language = navigator.SelectSingleNode("/upd:Update/upd:Properties/upd:Language", namespaces)?.Value;
+            return string.IsNullOrEmpty(language) || language.Equals("en", StringComparison.OrdinalIgnoreCase) || language.Equals("all", StringComparison.OrdinalIgnoreCase);
+        }
+
+
         static string ContentSyncLastFileDigest = "";
 
         private static void UpdateConsoleForMessageRefresh()
         {
-            if (!Console.IsOutputRedirected)
+            try
             {
-                Console.CursorLeft = 0;
+                if (!Console.IsOutputRedirected)
+                {
+                    Console.CursorLeft = 0;
+                }
+                else
+                {
+                    Console.WriteLine();
+                }
             }
-            else
+            catch (IOException)
+            {
+                Console.WriteLine();
+            }
+            catch (ArgumentOutOfRangeException)
             {
                 Console.WriteLine();
             }

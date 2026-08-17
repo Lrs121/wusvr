@@ -144,6 +144,7 @@ namespace Microsoft.PackageGraph.MicrosoftUpdate.Metadata
                     u.Prerequisites.OfType<AtLeastOne>()
                     .SelectMany(p => p.Simple)
                     .Select(s => s.UpdateId)
+                    .Concat(u.Prerequisites.OfType<Simple>().Select(s => s.UpdateId))
                     .Intersect(CategoryFilter).Any());
             }
 

@@ -19,11 +19,12 @@ namespace Microsoft.PackageGraph.Utilitites.Upsync
     {
         public static void Run(RunUpstreamServerOptions options)
         {
-            var serviceConfigurationJson = File.ReadAllText("./upstream-server-config.json");
-            var bindEndpoint = "localhost";
-            var bindPort = 40080;
-            var metadataPath = "./store";
-            var contentPath = "./content";
+            var serviceConfigurationPath = string.IsNullOrEmpty(options.ServiceConfigurationPath) ? "./upstream-server-config.json" : options.ServiceConfigurationPath;
+            var serviceConfigurationJson = File.ReadAllText(serviceConfigurationPath);
+            var bindEndpoint = string.IsNullOrEmpty(options.Endpoint) ? "*" : options.Endpoint;
+            var bindPort = options.Port;
+            var metadataPath = string.IsNullOrEmpty(options.Path) ? "./store" : options.Path;
+            var contentPath = string.IsNullOrEmpty(options.ContentSourcePath) ? "./content" : options.ContentSourcePath;
 
 var host = new WebHostBuilder()
     // Bind to a specific IP address or HOST NAME

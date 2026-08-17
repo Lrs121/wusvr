@@ -8,6 +8,9 @@ using Microsoft.UpdateServices.WebServices.ServerSync;
 using System.Linq;
 using System.IO;
 using System.Text;
+using System.Globalization;
+using System.Text.RegularExpressions;
+using System.Xml;
 using Microsoft.PackageGraph.Storage;
 using Microsoft.PackageGraph.MicrosoftUpdate.Metadata;
 using Microsoft.PackageGraph.MicrosoftUpdate.Metadata.Prerequisites;
@@ -23,6 +26,8 @@ namespace Microsoft.PackageGraph.MicrosoftUpdate.Endpoints.ServerSync
     /// </summary>
     public class ServerSyncWebService : IServerSyncAspNetCore
     {
+        private IContentStore ContentStore;
+
         /// <summary>
         /// The source of upate metadata that this server serves.
         /// </summary>
@@ -136,6 +141,332 @@ namespace Microsoft.PackageGraph.MicrosoftUpdate.Endpoints.ServerSync
         }
 
         /// <summary>
+        /// Sets the content store used to determine whether advertised updates
+        /// can actually be served to a downstream WSUS server.
+        /// </summary>
+        public void SetContentStore(IContentStore contentStore)
+        {
+            ContentStore = contentStore;
+        }
+
+        private bool HasServableContent(MicrosoftUpdatePackageIdentity identity, HashSet<MicrosoftUpdatePackageIdentity> checkedUpdates)
+        {
+            if (ContentStore == null)
+            {
+                return true;
+            }
+
+            if (!checkedUpdates.Add(identity))
+            {
+                return true;
+            }
+
+            if (!PackageStore.ContainsPackage(identity))
+            {
+                Console.Error.WriteLine("Skipping update with missing metadata: " + identity);
+                return false;
+            }
+
+            var update = PackageStore.GetPackage(identity) as MicrosoftUpdatePackage;
+            if (update == null)
+            {
+                return false;
+            }
+
+            if (update.Files != null)
+            {
+                foreach (var file in update.Files)
+                {
+                    if (file == null || file.Digest == null || !ContentStore.Contains(file.Digest, out _))
+                    {
+                        Console.Error.WriteLine("Skipping update with missing content: " + identity);
+                        return false;
+                    }
+                }
+            }
+
+            if (update is SoftwareUpdate softwareUpdate && softwareUpdate.BundledUpdates != null)
+            {
+                foreach (var bundledUpdate in softwareUpdate.BundledUpdates)
+                {
+                    if (!HasServableContent(bundledUpdate, checkedUpdates))
+                    {
+                        Console.Error.WriteLine("Skipping update with incomplete bundled content: " + identity);
+                        return false;
+                    }
+                }
+            }
+
+            return true;
+        }
+
+        private bool IsServablePrerequisite(XmlNode node)
+        {
+            if (!Guid.TryParse(node.Attributes["UpdateID"]?.Value, out var prerequisiteId))
+            {
+                return false;
+            }
+
+            // WSUS 2.0 validates prerequisite identities against the
+            // revisions imported in the same synchronization. Update-package
+            // prerequisites are not reliably present in the filtered revision
+            // list, so retaining them produces Event 386. The legacy WSUS
+            // client can evaluate the applicability rules without these
+            // optional prerequisite groups, while retaining them makes the
+            // whole metadata import fail.
+            return false;
+        }
+
+        private string SanitizePrerequisites(string xml, MicrosoftUpdatePackageIdentity identity)
+        {
+            var document = new XmlDocument();
+            document.LoadXml(xml);
+            var namespaces = new XmlNamespaceManager(document.NameTable);
+            namespaces.AddNamespace("upd", "http://schemas.microsoft.com/msus/2002/12/Update");
+
+            var simpleNodes = document.SelectNodes("/upd:Update/upd:Relationships/upd:Prerequisites/upd:UpdateIdentity", namespaces);
+            foreach (XmlNode node in simpleNodes)
+            {
+                if (!IsServablePrerequisite(node))
+                {
+                    node.ParentNode.RemoveChild(node);
+                    Console.Error.WriteLine("Removed unavailable prerequisite from update " + identity);
+                }
+            }
+
+            var atLeastOneNodes = document.SelectNodes("/upd:Update/upd:Relationships/upd:Prerequisites/upd:AtLeastOne", namespaces);
+            foreach (XmlNode group in atLeastOneNodes)
+            {
+                var identities = group.SelectNodes("upd:UpdateIdentity", namespaces);
+                foreach (XmlNode node in identities)
+                {
+                    if (!IsServablePrerequisite(node))
+                    {
+                        group.RemoveChild(node);
+                        Console.Error.WriteLine("Removed unavailable AtLeastOne prerequisite from update " + identity);
+                    }
+                }
+
+                if (group.SelectNodes("upd:UpdateIdentity", namespaces).Count == 0)
+                {
+                    group.ParentNode.RemoveChild(group);
+                }
+            }
+
+            var prerequisitesElement = document.SelectSingleNode(
+                "/upd:Update/upd:Relationships/upd:Prerequisites",
+                namespaces);
+            if (prerequisitesElement != null && !prerequisitesElement.HasChildNodes)
+            {
+                prerequisitesElement.ParentNode.RemoveChild(prerequisitesElement);
+            }
+
+            var supersededNodes = document.SelectNodes(
+                "/upd:Update/upd:Relationships/upd:SupersededUpdates//upd:UpdateIdentity",
+                namespaces);
+            foreach (XmlNode node in supersededNodes)
+            {
+                // WSUS 2.0 requires a revision number for superseded-update
+                // identities. Legacy metadata often supplies only UpdateID.
+                if (node.Attributes["RevisionNumber"] == null)
+                {
+                    node.ParentNode.RemoveChild(node);
+                    Console.Error.WriteLine("Removed unresolved superseded update from update " + identity);
+                }
+            }
+
+            var supersededElement = document.SelectSingleNode(
+                "/upd:Update/upd:Relationships/upd:SupersededUpdates",
+                namespaces);
+            if (supersededElement != null && !supersededElement.HasChildNodes)
+            {
+                supersededElement.ParentNode.RemoveChild(supersededElement);
+            }
+
+            var localizedProperties = document.SelectNodes(
+                "/upd:Update/upd:LocalizedPropertiesCollection/upd:LocalizedProperties",
+                namespaces);
+            foreach (XmlNode localizedProperty in localizedProperties)
+            {
+                var language = localizedProperty.SelectSingleNode("upd:Language", namespaces)?.InnerText;
+                if (!string.Equals(language, "en", StringComparison.OrdinalIgnoreCase))
+                {
+                    localizedProperty.ParentNode.RemoveChild(localizedProperty);
+                }
+            }
+
+            var localizedPropertiesElement = document.SelectSingleNode(
+                "/upd:Update/upd:LocalizedPropertiesCollection",
+                namespaces);
+            if (localizedPropertiesElement != null && !localizedPropertiesElement.HasChildNodes)
+            {
+                localizedPropertiesElement.ParentNode.RemoveChild(localizedPropertiesElement);
+            }
+
+            return document.OuterXml;
+        }
+
+        private List<MicrosoftUpdatePackageIdentity> OrderBundledUpdatesFirst(IEnumerable<MicrosoftUpdatePackageIdentity> identities)
+        {
+            var candidates = new HashSet<MicrosoftUpdatePackageIdentity>(identities);
+            var ordered = new List<MicrosoftUpdatePackageIdentity>();
+            var visited = new HashSet<MicrosoftUpdatePackageIdentity>();
+
+            Action<MicrosoftUpdatePackageIdentity> visit = null;
+            visit = identity =>
+            {
+                if (!candidates.Contains(identity) || !visited.Add(identity))
+                {
+                    return;
+                }
+
+                if (Updates.TryGetValue(identity, out var update) && update is SoftwareUpdate softwareUpdate && softwareUpdate.BundledUpdates != null)
+                {
+                    foreach (var bundledUpdate in softwareUpdate.BundledUpdates)
+                    {
+                        visit(bundledUpdate);
+                    }
+                }
+
+                if (Updates.TryGetValue(identity, out update) && update.Prerequisites != null)
+                {
+                    foreach (var prerequisite in update.Prerequisites)
+                    {
+                        var prerequisites = prerequisite is AtLeastOne atLeastOne
+                            ? atLeastOne.Simple
+                            : new List<Simple> { (Simple)prerequisite };
+
+                        foreach (var simplePrerequisite in prerequisites)
+                        {
+                            var prerequisiteIdentity = candidates.FirstOrDefault(candidate => candidate.ID == simplePrerequisite.UpdateId);
+                            if (prerequisiteIdentity != null)
+                            {
+                                visit(prerequisiteIdentity);
+                            }
+                        }
+                    }
+                }
+
+                ordered.Add(identity);
+            };
+
+            foreach (var identity in candidates)
+            {
+                visit(identity);
+            }
+
+            return ordered;
+        }
+
+        private IEnumerable<Guid> ReadPrerequisiteIds(MicrosoftUpdatePackageIdentity identity)
+        {
+            var document = new XmlDocument();
+            using (var metadata = PackageStore.GetMetadata(identity))
+            {
+                document.Load(metadata);
+            }
+
+            var namespaces = new XmlNamespaceManager(document.NameTable);
+            namespaces.AddNamespace("upd", "http://schemas.microsoft.com/msus/2002/12/Update");
+            var result = document.SelectNodes(
+                    "/upd:Update/upd:Relationships/upd:Prerequisites//upd:UpdateIdentity/@UpdateID",
+                    namespaces)
+                .Cast<XmlAttribute>()
+                .Select(attribute => Guid.Parse(attribute.Value))
+                .Distinct()
+                .ToList();
+            return result;
+        }
+
+        // Prerequisites are represented in update XML by UpdateID only. They
+        // are not necessarily selected by the product/classification filter,
+        // but WSUS must have them in SUSDB before it imports dependent XML.
+        private bool AddPrerequisiteClosure(
+            MicrosoftUpdatePackageIdentity identity,
+            HashSet<MicrosoftUpdatePackageIdentity> included,
+            HashSet<MicrosoftUpdatePackageIdentity> visiting)
+        {
+            if (included.Contains(identity))
+            {
+                return true;
+            }
+
+            if (!visiting.Add(identity))
+            {
+                return true;
+            }
+
+            if (!Updates.TryGetValue(identity, out var update) ||
+                !HasServableContent(identity, new HashSet<MicrosoftUpdatePackageIdentity>()))
+            {
+                visiting.Remove(identity);
+                return false;
+            }
+
+            foreach (var prerequisiteId in ReadPrerequisiteIds(identity))
+            {
+                // Categories are already advertised by GetConfig and
+                // are not update revisions that can be added here.
+                if (Categories.Any(category => category.Id.ID == prerequisiteId))
+                {
+                    continue;
+                }
+
+                var prerequisiteRevisions = Updates
+                    .Where(pair => pair.Key.ID == prerequisiteId)
+                    .Select(pair => pair.Key)
+                    .Where(candidate => HasServableContent(candidate, new HashSet<MicrosoftUpdatePackageIdentity>()))
+                    .ToList();
+
+                // Returning this update would leave an UpdateIdentity
+                // in its XML that WSUS cannot resolve.
+                if (prerequisiteRevisions.Count == 0)
+                {
+                    Console.Error.WriteLine("Skipping update with unavailable prerequisite " + prerequisiteId + ": " + identity);
+                    visiting.Remove(identity);
+                    return false;
+                }
+
+                foreach (var prerequisiteRevision in prerequisiteRevisions)
+                {
+                    if (!AddPrerequisiteClosure(prerequisiteRevision, included, visiting))
+                    {
+                        visiting.Remove(identity);
+                        return false;
+                    }
+                }
+            }
+
+            visiting.Remove(identity);
+            included.Add(identity);
+            return true;
+        }
+
+        private List<MicrosoftUpdatePackageIdentity> AddPrerequisiteUpdates(IEnumerable<MicrosoftUpdatePackageIdentity> identities)
+        {
+            var included = new HashSet<MicrosoftUpdatePackageIdentity>();
+            foreach (var identity in identities)
+            {
+                AddPrerequisiteClosure(identity, included, new HashSet<MicrosoftUpdatePackageIdentity>());
+            }
+
+            return included.ToList();
+        }
+
+        private static string NormalizeLegacyDateTimes(string xml)
+        {
+            return Regex.Replace(xml, @"\b\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})\b", match =>
+            {
+                if (!DateTimeOffset.TryParse(match.Value, CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind, out var value))
+                {
+                    return match.Value;
+                }
+
+                return value.UtcDateTime.ToString("yyyy-MM-dd'T'HH:mm:ss.fff'Z'", CultureInfo.InvariantCulture);
+            });
+        }
+
+        /// <summary>
         /// Handle authentication data requests
         /// </summary>
         /// <param name="request">The request data. Not used</param>
@@ -246,14 +577,23 @@ namespace Microsoft.PackageGraph.MicrosoftUpdate.Endpoints.ServerSync
                     }
                     
                     // Deduplicate result and convert to raw identity format
-                    response.NewRevisions = filteredResult
+                    var advertisedUpdates = filteredResult
                         .Union(bundledUpdates)
-                        .Distinct()
+                                        .Distinct()
+                        .Where(u => PackageStore.ContainsPackage(u))
+                        .Where(u => HasServableContent(u, new HashSet<MicrosoftUpdatePackageIdentity>()))
+                        .ToList();
+
+                    var withPrerequisites = AddPrerequisiteUpdates(advertisedUpdates);
+                    response.NewRevisions = OrderBundledUpdatesFirst(withPrerequisites)
                         .Select(u => new UpdateIdentity() { UpdateID = u.ID, RevisionNumber = u.Revision })
                         .ToArray();
                 }
             }
-            catch(Exception) { }
+            catch(Exception ex)
+            {
+                Console.Error.WriteLine("GetRevisionIdList failed: " + ex.Message);
+            }
 
             PackageStoreLock.ReleaseReaderLock();
 
@@ -286,6 +626,7 @@ namespace Microsoft.PackageGraph.MicrosoftUpdate.Endpoints.ServerSync
 
             // Make sure the request is not larger than the config says
             var updateRequestCount = request.GetUpdateData.updateIds.Length;
+            Console.WriteLine("GetUpdateData: requested " + updateRequestCount + " updates; first=" + request.GetUpdateData.updateIds.FirstOrDefault()?.UpdateID + "/" + request.GetUpdateData.updateIds.FirstOrDefault()?.RevisionNumber);
             if (updateRequestCount > serviceConfiguration.MaxNumberOfUpdatesPerRequest)
             {
                 return null;
@@ -295,6 +636,7 @@ namespace Microsoft.PackageGraph.MicrosoftUpdate.Endpoints.ServerSync
 
             var returnUpdatesList = new List<ServerSyncUpdateData>();
             var returnFilesList = new List<ServerSyncUrlData>();
+            var checkedUpdates = new HashSet<MicrosoftUpdatePackageIdentity>();
 
             try
             {
@@ -304,6 +646,7 @@ namespace Microsoft.PackageGraph.MicrosoftUpdate.Endpoints.ServerSync
 
                     if (!PackageStore.ContainsPackage(updateIdentity))
                     {
+                        Console.Error.WriteLine("GetUpdateData missing package: " + rawIdentity.UpdateID + "/" + rawIdentity.RevisionNumber + "; returned " + returnUpdatesList.Count + " of " + updateRequestCount);
                         throw new Exception("Update not found");
                     }
 
@@ -319,7 +662,7 @@ namespace Microsoft.PackageGraph.MicrosoftUpdate.Endpoints.ServerSync
                                 {
                                     FileDigest = Convert.FromBase64String(updateFile.Digest.DigestBase64),
                                     MUUrl = microsoftUpdateFile.Urls[0].MuUrl,
-                                    UssUrl = $"microsoftupdate/content/{FileSystemContentStore.GetContentDirectoryName(microsoftUpdateFile.Digest)}/{updateFile.FileName}"
+                                    UssUrl = $"microsoftupdate/content/{microsoftUpdateFile.Digest.HexString}"
                                 });
                         }
                     }
@@ -331,13 +674,18 @@ namespace Microsoft.PackageGraph.MicrosoftUpdate.Endpoints.ServerSync
 
                     using (var metadataReader = new StreamReader(PackageStore.GetMetadata(update.Id), Encoding.Unicode))
                     {
-                        rawUpdateData.XmlUpdateBlob = metadataReader.ReadToEnd();
+                        var metadataXml = metadataReader.ReadToEnd();
+                        metadataXml = SanitizePrerequisites(metadataXml, updateIdentity);
+                        rawUpdateData.XmlUpdateBlob = NormalizeLegacyDateTimes(metadataXml);
                     }
 
                     returnUpdatesList.Add(rawUpdateData);
                 }
             }
-            catch(Exception) { }
+            catch(Exception ex)
+            {
+                Console.Error.WriteLine("GetUpdateData failed after " + returnUpdatesList.Count + " of " + updateRequestCount + ": " + ex.GetType().Name + ": " + ex.Message);
+            }
 
             response.updates = returnUpdatesList.ToArray();
             // Deduplicate list of files
@@ -422,7 +770,7 @@ namespace Microsoft.PackageGraph.MicrosoftUpdate.Endpoints.ServerSync
         /// <exception cref="NotImplementedException"></exception>
         public Task<DownloadFilesResponse> DownloadFilesAsync(DownloadFilesRequest request)
         {
-            throw new NotImplementedException();
+            return Task.FromResult(new DownloadFilesResponse { DownloadFilesResponse1 = new DownloadFilesResponseBody() });
         }
     }
 }
